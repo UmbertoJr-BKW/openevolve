@@ -1,13 +1,11 @@
-"""
-OpenAI API interface for LLMs
-"""
-
 import asyncio
 import logging
-import time
-from typing import Any, Dict, List, Optional, Union
+import os
+from urllib.parse import urlsplit
+from typing import Any, Dict, List, Optional
 
 import openai
+from openai import AzureOpenAI  # <-- add this import
 
 from openevolve.config import LLMConfig
 from openevolve.llm.base import LLMInterface
@@ -18,10 +16,7 @@ logger = logging.getLogger(__name__)
 class OpenAILLM(LLMInterface):
     """LLM interface using OpenAI-compatible APIs"""
 
-    def __init__(
-        self,
-        model_cfg: Optional[dict] = None,
-    ):
+    def __init__(self, model_cfg: Optional[dict] = None):
         self.model = model_cfg.name
         self.system_message = model_cfg.system_message
         self.temperature = model_cfg.temperature
@@ -35,26 +30,47 @@ class OpenAILLM(LLMInterface):
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
 
-        # Set up API client
-        # OpenAI client requires max_retries to be int, not None
-        max_retries = self.retries if self.retries is not None else 0
-        self.client = openai.OpenAI(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            timeout=self.timeout,
-            max_retries=max_retries,
+        # Optional: pull api_version from config or env (fallback to a sane default)
+        self.api_version = getattr(model_cfg, "api_version", None) or os.getenv(
+            "AZURE_OPENAI_API_VERSION", "2025-01-01-preview"
         )
+
+        # Detect Azure vs OpenAI
+        api_base_lower = (self.api_base or "").lower()
+        self.is_azure = "openai.azure.com" in api_base_lower
+
+        max_retries = self.retries if self.retries is not None else 0
+
+        if self.is_azure:
+            # Extract resource root (scheme + host) from any api_base (even if it includes /openai/deployments/…)
+            parts = urlsplit(self.api_base)
+            azure_endpoint = f"{parts.scheme}://{parts.netloc}"
+
+            # Use the Azure client so it appends ?api-version=… correctly
+            self.client = AzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_key=self.api_key,
+                api_version=self.api_version,
+                timeout=self.timeout,
+                max_retries=max_retries,
+            )
+        else:
+            # Standard OpenAI client
+            self.client = openai.OpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=self.timeout,
+                max_retries=max_retries,
+            )
 
         # Only log unique models to reduce duplication
         if not hasattr(logger, "_initialized_models"):
             logger._initialized_models = set()
-
         if self.model not in logger._initialized_models:
             logger.info(f"Initialized OpenAI LLM with model: {self.model}")
             logger._initialized_models.add(self.model)
 
     async def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text from a prompt"""
         return await self.generate_with_context(
             system_message=self.system_message,
             messages=[{"role": "user", "content": prompt}],
@@ -64,62 +80,30 @@ class OpenAILLM(LLMInterface):
     async def generate_with_context(
         self, system_message: str, messages: List[Dict[str, str]], **kwargs
     ) -> str:
-        """Generate text using a system message and conversational context"""
-        # Prepare messages with system message
         formatted_messages = [{"role": "system", "content": system_message}]
         formatted_messages.extend(messages)
 
-        # Set up generation parameters
-        # Define OpenAI reasoning models that require max_completion_tokens
-        # These models don't support temperature/top_p and use different parameters
-        OPENAI_REASONING_MODEL_PREFIXES = (
-            # O-series reasoning models
-            "o1-",
-            "o1",  # o1, o1-mini, o1-preview
-            "o3-",
-            "o3",  # o3, o3-mini, o3-pro
-            "o4-",  # o4-mini
-            # GPT-5 series are also reasoning models
-            "gpt-5-",
-            "gpt-5",  # gpt-5, gpt-5-mini, gpt-5-nano
-            # The GPT OSS series are also reasoning models
-            "gpt-oss-120b",
-            "gpt-oss-20b",
+        # Reasoning model prefixes (apply for both OpenAI and Azure)
+        REASONING_PREFIXES = (
+            "o1", "o1-", "o3", "o3-", "o4-",  # O-series
+            "gpt-5", "gpt-5-",                # GPT-5 series
+            "gpt-oss-120b", "gpt-oss-20b",
         )
-
-        # Check if this is an OpenAI reasoning model
         model_lower = str(self.model).lower()
-        api_base_lower = (self.api_base or "").lower()
-        #check for official OpenAI API endpoints
-        is_openai_api = (
-            api_base_lower.startswith("https://api.openai.com")
-            or api_base_lower.startswith("https://eu.api.openai.com")
-            or api_base_lower.startswith("https://apac.api.openai.com")
-            or api_base_lower.startswith("http://api.openai.com")  # Allow http for testing
-            or api_base_lower.startswith("http://eu.api.openai.com")
-            or api_base_lower.startswith("http://apac.api.openai.com")
-       )
+        is_reasoning_model = model_lower.startswith(REASONING_PREFIXES)
 
-        is_openai_reasoning_model = (
-            is_openai_api
-            and model_lower.startswith(OPENAI_REASONING_MODEL_PREFIXES)
-     ) 
-
-        if is_openai_reasoning_model:
-            # For OpenAI reasoning models
+        if is_reasoning_model:
             params = {
-                "model": self.model,
+                "model": self.model,  # In Azure: this is the *deployment name*
                 "messages": formatted_messages,
                 "max_completion_tokens": kwargs.get("max_tokens", self.max_tokens),
             }
-            # Add optional reasoning parameters if provided
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
             if "verbosity" in kwargs:
                 params["verbosity"] = kwargs["verbosity"]
         else:
-            # Standard parameters for all other models
             params = {
                 "model": self.model,
                 "messages": formatted_messages,
@@ -127,25 +111,15 @@ class OpenAILLM(LLMInterface):
                 "top_p": kwargs.get("top_p", self.top_p),
                 "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             }
-
-            # Handle reasoning_effort for open source reasoning models.
             reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
             if reasoning_effort is not None:
                 params["reasoning_effort"] = reasoning_effort
 
-        # Add seed parameter for reproducibility if configured
-        # Skip seed parameter for Google AI Studio endpoint as it doesn't support it
+        # Seed (avoid on Google openai-compatible endpoint)
         seed = kwargs.get("seed", self.random_seed)
-        if seed is not None:
-            if self.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/":
-                logger.warning(
-                    "Skipping seed parameter as Google AI Studio endpoint doesn't support it. "
-                    "Reproducibility may be limited."
-                )
-            else:
-                params["seed"] = seed
+        if seed is not None and self.api_base != "https://generativelanguage.googleapis.com/v1beta/openai/":
+            params["seed"] = seed
 
-        # Attempt the API call with retries
         retries = kwargs.get("retries", self.retries)
         retry_delay = kwargs.get("retry_delay", self.retry_delay)
         timeout = kwargs.get("timeout", self.timeout)
@@ -172,14 +146,9 @@ class OpenAILLM(LLMInterface):
                     raise
 
     async def _call_api(self, params: Dict[str, Any]) -> str:
-        """Make the actual API call"""
-        # Use asyncio to run the blocking API call in a thread pool
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, lambda: self.client.chat.completions.create(**params)
-        )
-        # Logging of system prompt, user message and response content
+        resp = await loop.run_in_executor(None, lambda: self.client.chat.completions.create(**params))
         logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")
-        logger.debug(f"API response: {response.choices[0].message.content}")
-        return response.choices[0].message.content
+        logger.debug(f"API response: {resp.choices[0].message.content}")
+        return resp.choices[0].message.content

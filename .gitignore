@@ -53,3 +53,7 @@ htmlcov/
 # For SR
 secrets.yaml
 problems
+.env.examples
+
+# local secrets
+.env

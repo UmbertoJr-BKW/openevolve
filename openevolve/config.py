@@ -21,6 +21,7 @@ class LLMModelConfig:
     api_base: str = None
     api_key: Optional[str] = None
     name: str = None
+    api_version: Optional[str] = None
 
     # Custom LLM client
     init_client: Optional[Callable] = None
@@ -52,6 +53,7 @@ class LLMConfig(LLMModelConfig):
 
     # API configuration
     api_base: str = "https://api.openai.com/v1"
+    api_version: Optional[str] = None
 
     # Generation parameters
     system_message: Optional[str] = "system_message"
@@ -131,6 +133,7 @@ class LLMConfig(LLMModelConfig):
             "retry_delay": self.retry_delay,
             "random_seed": self.random_seed,
             "reasoning_effort": self.reasoning_effort,
+            "api_version": self.api_version, 
         }
         self.update_model_params(shared_config)
 
@@ -495,19 +498,24 @@ class Config:
 
 
 def load_config(config_path: Optional[Union[str, Path]] = None) -> Config:
-    """Load configuration from a YAML file or use defaults"""
     if config_path and os.path.exists(config_path):
         config = Config.from_yaml(config_path)
     else:
         config = Config()
-
-        # Use environment variables if available
         api_key = os.environ.get("OPENAI_API_KEY")
         api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
-
         config.llm.update_model_params({"api_key": api_key, "api_base": api_base})
 
-    # Make the system message available to the individual models, in case it is not provided from the prompt sampler
-    config.llm.update_model_params({"system_message": config.prompt.system_message})
+    # NEW: overlay env if YAML didn’t set them
+    if not getattr(config.llm, "api_key", None):
+        env_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY")
+        if env_key:
+            config.llm.update_model_params({"api_key": env_key})
+    if not getattr(config.llm, "api_base", None):
+        env_base = os.environ.get("OPENAI_API_BASE")
+        if env_base:
+            config.llm.update_model_params({"api_base": env_base})
 
+    # Keep existing line
+    config.llm.update_model_params({"system_message": config.prompt.system_message})
     return config
